@@ -5,6 +5,7 @@
 //   turn 0|90|180|270  지정한 각도로 설정
 //   turn reset         0°로 복구
 //   turn list          연결된 디스플레이 목록
+//   turn auto          맥북을 돌리면 내장 가속도계로 감지해서 자동 회전
 //   옵션: -d <displayID>  대상 디스플레이 지정 (기본: 내장 화면, 없으면 메인 화면)
 //
 // 화면이 돌아가 있는 동안에는 백그라운드 프로세스(turn --track)가 이벤트 탭으로
@@ -14,6 +15,9 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <IOKit/IOKitLib.h>
+#import <IOKit/hid/IOHIDDevice.h>
+#import <AppKit/AppKit.h>
 #include <signal.h>
 #include <spawn.h>
 #include <fcntl.h>
@@ -193,6 +197,12 @@ static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRe
     // 회전한 Dock 스와이프를 보내는 동안에는 원래 짝 이벤트를 막음 (우리가 짝을 따로 보냄)
     if (type == kTurnEventGesture) return gDockSwipeActive ? NULL : event;
 
+    // 0°(자동 회전 모드에서 똑바로 놓인 상태)에서는 입력을 건드리지 않음
+    if (gOrientation == 0) {
+        gCursor = CGEventGetLocation(event);
+        return event;
+    }
+
     if (type == kCGEventScrollWheel) {
         CGEventRef e = CGEventCreate(NULL);
         BOOL onTarget = CGRectContainsPoint(bounds, CGEventGetLocation(e));
@@ -358,7 +368,242 @@ static void restoreAndExit(int sig) {
     _exit(0);
 }
 
-static int runTracker(CGDirectDisplayID display, int orientation) {
+// 회전 중에만 트랙패드와 커서 연결을 끊음
+static void setPointerDetached(BOOL detached) {
+    CGAssociateMouseAndMouseCursorPosition(!detached);
+    gDisassociated = detached;
+}
+
+#pragma mark - 자동 회전 (내장 가속도계)
+//
+// Apple Silicon 맥북의 IMU(Bosch BMI286)는 공개 API가 없고 AppleSPUHIDDevice
+// (usage page 0xFF00, usage 3)로 노출된다. AppleSPUHIDDriver 속성으로 센서를 깨운 뒤
+// 22바이트 리포트의 6/10/14 바이트에 있는 int32(Q16.16, 단위 g)를 읽는다.
+// 방법: olvvier/apple-silicon-accelerometer, taigrr/apple-silicon-accelerometer
+
+static MPDisplay *gAutoDisplay;
+static uint8_t gAccelReport[4096];
+static double gGravity[3];
+static BOOL gGravityReady;
+static long gAccelSamples;
+static int gCandidate = -1;
+static CFAbsoluteTime gCandidateSince;
+
+static const double kAutoRotateHoldSeconds = 0.8;  // 같은 방향이 이만큼 유지돼야 회전
+
+static uint8_t gLidReport[4096];
+static double gLidAngle = 110;  // 화면이 열린 각도(도). lid 센서를 못 읽으면 흔한 값으로 가정
+
+static void onLidReport(void *ctx, IOReturn result, void *sender, IOHIDReportType type,
+                        uint32_t reportID, uint8_t *report, CFIndex length) {
+    if (length < 3 || report[0] != 1) return;
+    int angle = (report[1] | report[2] << 8) & 0x1FF;
+    if (angle > 0 && angle <= 360) gLidAngle = angle;
+}
+
+// 중력 벡터(센서 좌표, g)로부터 화면 방향(MPDisplay 각도)을 구함. 판단할 수 없으면 -1
+//
+// 센서 축(본체 기준, NSEvent/tilt-sim-experiment 문서): x=오른쪽, y=힌지 쪽, z=키보드 위쪽.
+// 값은 중력이 향하는 방향이라 평평하게 두면 (0, 0, -1g).
+// 화면은 힌지에서 L도 열려 있으므로 화면 평면의 중력은
+//   오른쪽 성분 = x,  화면 위쪽 성분 = -y·cos L + z·sin L
+// 이 벡터가 화면 아래쪽이면 0°, 오른쪽이면 90°(맥북 오른쪽이 바닥), 위쪽이면 180°, 왼쪽이면 270°.
+static int orientationFromGravity(double x, double y, double z) {
+    double lid = gLidAngle * M_PI / 180;
+    double right = x;
+    double up = -y * cos(lid) + z * sin(lid);
+    // 맥북을 눕혀서 화면이 거의 수평이면 방향을 판단하지 않음
+    if (sqrt(right * right + up * up) < 0.5) return -1;
+
+    double angle = atan2(right, -up) * 180 / M_PI;  // 0=평소, +90=오른쪽 아래, ±180=거꾸로, -90=왼쪽 아래
+    if (angle < 0) angle += 360;
+    int nearest = ((int)lround(angle / 90) % 4) * 90;
+    double diff = fabs(angle - nearest);
+    if (diff > 180) diff = 360 - diff;
+    // 경계에서 왔다갔다하지 않도록 기준 방향 ±30° 안에 들어올 때만 인정
+    return diff <= 30 ? nearest : -1;
+}
+
+static void applyOrientation(int orientation) {
+    [gAutoDisplay setOrientation:orientation];
+    gOrientation = orientation;
+    gDockSwipeActive = NO;
+    gLastWarp = CGPointZero;
+    CGEventRef e = CGEventCreate(NULL);
+    gCursor = CGEventGetLocation(e);
+    CFRelease(e);
+    setPointerDetached(orientation != 0);
+}
+
+#pragma mark - 자동 회전 애니메이션
+//
+// 모든 창 위에 검은 오버레이를 서서히 띄우고(페이드 인), 가려진 상태에서 실제 방향을 바꾼 뒤
+// 서서히 걷어낸다(페이드 아웃). 방향 전환 때 생기는 깜빡임과 창 재배치가 보이지 않는다.
+
+static BOOL gRotating;
+static NSWindow *gOverlay;
+static const NSTimeInterval kFadeInSeconds = 0.2;
+static const NSTimeInterval kFadeOutSeconds = 0.3;
+
+// CG 전역 좌표(주 화면 왼쪽 위 원점) → Cocoa 화면 좌표(주 화면 왼쪽 아래 원점)
+static NSRect cocoaFrameForDisplay(CGDirectDisplayID display) {
+    CGRect b = CGDisplayBounds(display);
+    CGFloat primaryHeight = CGDisplayBounds(CGMainDisplayID()).size.height;
+    return NSMakeRect(b.origin.x, primaryHeight - b.origin.y - b.size.height, b.size.width, b.size.height);
+}
+
+static NSWindow *makeOverlayWindow(NSRect frame) {
+    NSWindow *w = [[NSWindow alloc] initWithContentRect:frame styleMask:NSWindowStyleMaskBorderless
+                                                backing:NSBackingStoreBuffered defer:NO];
+    w.releasedWhenClosed = NO;
+    w.level = NSScreenSaverWindowLevel;
+    w.backgroundColor = NSColor.blackColor;
+    w.opaque = YES;
+    w.hasShadow = NO;
+    w.ignoresMouseEvents = YES;
+    w.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorStationary |
+                           NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorIgnoresCycle;
+    w.contentView.wantsLayer = YES;
+    w.contentView.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+    return w;
+}
+
+static void finishRotation(void) {
+    [gOverlay orderOut:nil];
+    gOverlay = nil;
+    gRotating = NO;
+}
+
+static void fadeOutOverlay(void) {
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+        context.duration = kFadeOutSeconds;
+        gOverlay.animator.alphaValue = 0;
+    } completionHandler:^{
+        finishRotation();
+    }];
+}
+
+// 방향을 바꾼 뒤 디스플레이 크기가 새 방향으로 바뀔 때까지 기다림 (최대 약 1.5초)
+static void waitForDisplaySize(CGSize expected, int triesLeft, void (^done)(void)) {
+    CGSize now = CGDisplayBounds(gDisplay).size;
+    if (CGSizeEqualToSize(now, expected) || triesLeft <= 0) {
+        done();
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        waitForDisplaySize(expected, triesLeft - 1, done);
+    });
+}
+
+static void rotateWithAnimation(int to) {
+    gRotating = YES;
+    CGSize oldSize = CGDisplayBounds(gDisplay).size;
+    CGSize newSize = (to - gOrientation) % 180 ? CGSizeMake(oldSize.height, oldSize.width) : oldSize;
+
+    gOverlay = makeOverlayWindow(cocoaFrameForDisplay(gDisplay));
+    gOverlay.alphaValue = 0;
+    [gOverlay orderFrontRegardless];
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+        context.duration = kFadeInSeconds;
+        gOverlay.animator.alphaValue = 1;
+    } completionHandler:^{
+        applyOrientation(to);
+        waitForDisplaySize(newSize, 75, ^{
+            // 새 방향의 화면 크기에 맞춰 오버레이를 다시 덮은 뒤 걷어냄
+            [gOverlay setFrame:cocoaFrameForDisplay(gDisplay) display:YES];
+            fadeOutOverlay();
+        });
+    }];
+}
+
+static void onAccelReport(void *ctx, IOReturn result, void *sender, IOHIDReportType type,
+                          uint32_t reportID, uint8_t *report, CFIndex length) {
+    if (length != 22) return;
+    int32_t raw[3];
+    memcpy(raw, report + 6, sizeof(raw));
+    for (int i = 0; i < 3; i++) {
+        // OSSwapLittleToHostInt32 는 부호 없는 값을 돌려주므로 int32_t 로 되돌려야 음수가 보존됨
+        double g = (int32_t)OSSwapLittleToHostInt32(raw[i]) / 65536.0;
+        gGravity[i] = gGravityReady ? gGravity[i] * 0.98 + g * 0.02 : g;  // 흔들림 제거용 저역 통과
+    }
+    gGravityReady = YES;
+
+    // 약 800Hz로 들어오므로 20번에 한 번(약 25ms마다)만 판단
+    if (++gAccelSamples % 20) return;
+    if (gRotating) return;  // 애니메이션 중에는 판단하지 않음
+    int orientation = orientationFromGravity(gGravity[0], gGravity[1], gGravity[2]);
+    if (orientation < 0 || orientation == gOrientation) {
+        gCandidate = -1;
+        return;
+    }
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (orientation != gCandidate) {
+        gCandidate = orientation;
+        gCandidateSince = now;
+    } else if (now - gCandidateSince >= kAutoRotateHoldSeconds) {
+        gCandidate = -1;
+        rotateWithAnimation(orientation);
+    }
+}
+
+static long registryInt(io_service_t svc, CFStringRef key) {
+    CFTypeRef ref = IORegistryEntryCreateCFProperty(svc, key, NULL, 0);
+    long v = 0;
+    if (ref && CFGetTypeID(ref) == CFNumberGetTypeID()) CFNumberGetValue(ref, kCFNumberLongType, &v);
+    if (ref) CFRelease(ref);
+    return v;
+}
+
+static BOOL startAutoRotate(CGDirectDisplayID displayID) {
+    [[NSBundle bundleWithPath:@"/System/Library/PrivateFrameworks/MonitorPanel.framework"] load];
+    MPDisplayMgr *mgr = [[NSClassFromString(@"MPDisplayMgr") alloc] init];
+    for (MPDisplay *d in [mgr displays]) {
+        if ([d displayID] == (int)displayID) gAutoDisplay = d;
+    }
+    if (!gAutoDisplay) return NO;
+
+    io_iterator_t it;
+    io_service_t svc;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AppleSPUHIDDriver"), &it) == KERN_SUCCESS) {
+        const char *keys[] = {"SensorPropertyReportingState", "SensorPropertyPowerState", "ReportInterval"};
+        int32_t values[] = {1, 1, 1000};
+        while ((svc = IOIteratorNext(it))) {
+            for (int i = 0; i < 3; i++) {
+                CFStringRef k = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
+                CFNumberRef n = CFNumberCreate(NULL, kCFNumberSInt32Type, &values[i]);
+                IORegistryEntrySetCFProperty(svc, k, n);
+                CFRelease(k);
+                CFRelease(n);
+            }
+            IOObjectRelease(svc);
+        }
+        IOObjectRelease(it);
+    }
+
+    BOOL opened = NO;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AppleSPUHIDDevice"), &it) == KERN_SUCCESS) {
+        while ((svc = IOIteratorNext(it))) {
+            long page = registryInt(svc, CFSTR("PrimaryUsagePage"));
+            long usage = registryInt(svc, CFSTR("PrimaryUsage"));
+            BOOL isAccel = !opened && page == 0xFF00 && usage == 3;
+            BOOL isLid = page == 0x20 && usage == 138;  // 화면 열림 각도 센서
+            if (isAccel || isLid) {
+                IOHIDDeviceRef dev = IOHIDDeviceCreate(kCFAllocatorDefault, svc);
+                if (dev && IOHIDDeviceOpen(dev, kIOHIDOptionsTypeNone) == kIOReturnSuccess) {
+                    IOHIDDeviceRegisterInputReportCallback(dev, isAccel ? gAccelReport : gLidReport, 4096,
+                                                           isAccel ? onAccelReport : onLidReport, NULL);
+                    IOHIDDeviceScheduleWithRunLoop(dev, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+                    if (isAccel) opened = YES;
+                }
+            }
+            IOObjectRelease(svc);
+        }
+        IOObjectRelease(it);
+    }
+    return opened;
+}
+
+static int runTracker(CGDirectDisplayID display, int orientation, BOOL autoRotate) {
     // 종료될 때 트랙패드와 커서 연결을 반드시 되돌림 (시작 직후 종료돼도 처리되도록 가장 먼저 등록)
     signal(SIGTERM, restoreAndExit);
     signal(SIGINT, restoreAndExit);
@@ -387,13 +632,22 @@ static int runTracker(CGDirectDisplayID display, int orientation) {
                             mask, tapCallback, NULL);
     if (!gTap) return 1;
 
-    CGAssociateMouseAndMouseCursorPosition(false);
-    gDisassociated = 1;
+    if (autoRotate) {
+        // 회전 애니메이션 창을 띄우기 위해 Dock 아이콘 없는 앱으로 초기화
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        if (!startAutoRotate(display)) return 1;
+    }
+    setPointerDetached(gOrientation != 0);
 
     CFRunLoopSourceRef loopSource = CFMachPortCreateRunLoopSource(NULL, gTap, 0);
     CFRunLoopAddSource(CFRunLoopGetCurrent(), loopSource, kCFRunLoopCommonModes);
     CGEventTapEnable(gTap, true);
-    CFRunLoopRun();
+    if (autoRotate) {
+        [NSApp run];
+    } else {
+        CFRunLoopRun();
+    }
     return 0;
 }
 
@@ -410,7 +664,7 @@ static void stopTracker(void) {
     [[NSFileManager defaultManager] removeItemAtPath:pidFilePath() error:nil];
 }
 
-static BOOL startTracker(int displayID, int angle) {
+static BOOL startTracker(int displayID, int angle, BOOL autoRotate) {
     NSDictionary *opts = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
     if (!AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts)) {
         fprintf(stderr,
@@ -426,7 +680,7 @@ static BOOL startTracker(int displayID, int angle) {
     char idArg[16], angleArg[16];
     snprintf(idArg, sizeof(idArg), "%d", displayID);
     snprintf(angleArg, sizeof(angleArg), "%d", angle);
-    char *args[] = {path, "--track", idArg, angleArg, NULL};
+    char *args[] = {path, autoRotate ? "--auto" : "--track", idArg, angleArg, NULL};
 
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
@@ -456,14 +710,16 @@ static BOOL startTracker(int displayID, int angle) {
 
 static void usage(void) {
     fprintf(stderr,
-        "사용법: turn [0|90|180|270|reset|list] [-d displayID]\n"
-        "  인자 없이 실행하면 90°씩 반시계방향으로 회전합니다.\n");
+        "사용법: turn [0|90|180|270|reset|list|auto] [-d displayID]\n"
+        "  인자 없이 실행하면 90°씩 반시계방향으로 회전합니다.\n"
+        "  auto: 맥북을 돌리면 내장 가속도계로 감지해서 화면을 자동으로 회전합니다.\n");
 }
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc == 4 && strcmp(argv[1], "--track") == 0) {
-            return runTracker((CGDirectDisplayID)strtoul(argv[2], NULL, 10), atoi(argv[3]));
+        if (argc == 4 && (strcmp(argv[1], "--track") == 0 || strcmp(argv[1], "--auto") == 0)) {
+            return runTracker((CGDirectDisplayID)strtoul(argv[2], NULL, 10), atoi(argv[3]),
+                              strcmp(argv[1], "--auto") == 0);
         }
 
         [[NSBundle bundleWithPath:@"/System/Library/PrivateFrameworks/MonitorPanel.framework"] load];
@@ -517,6 +773,17 @@ int main(int argc, const char *argv[]) {
         }
 
         int current = [target orientation];
+
+        if ([command isEqualToString:@"auto"]) {
+            stopTracker();
+            if (!startTracker([target displayID], current, YES)) {
+                fprintf(stderr, "자동 회전을 시작하지 못했습니다.\n");
+                return 1;
+            }
+            printf("자동 회전을 켰습니다. 끄려면 turn reset 또는 원하는 각도를 입력하세요.\n");
+            return 0;
+        }
+
         int angle;
         if (command == nil) {
             angle = (current + 90) % 360;
@@ -535,7 +802,7 @@ int main(int argc, const char *argv[]) {
         printf("%s: %d° → %d°\n", [[target displayName] UTF8String], current, angle);
 
         if (angle != 0) {
-            if (startTracker([target displayID], angle)) {
+            if (startTracker([target displayID], angle, NO)) {
                 printf("트랙패드 방향도 %d°에 맞췄습니다.\n", angle);
             } else {
                 fprintf(stderr, "트랙패드 방향 보정을 시작하지 못했습니다.\n");
